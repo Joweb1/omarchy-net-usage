@@ -2,7 +2,7 @@
 
 A lightweight, beautiful, resource-efficient status bar widget for [Omarchy](https://omarchy.org/) Linux that displays live active network session data usage and persistent daily data consumption.
 
-![Omarchy Bar](https://raw.githubusercontent.com/jovibe/omarchy-net-usage/main/preview.png)
+![Omarchy Bar](https://raw.githubusercontent.com/Joweb1/omarchy-net-usage/main/preview.png)
 
 ## Features
 
@@ -32,7 +32,7 @@ A lightweight, beautiful, resource-efficient status bar widget for [Omarchy](htt
 ### Method 1: Via Omarchy Plugin Manager (Recommended)
 
 ```bash
-omarchy plugin add https://github.com/jovibe/omarchy-net-usage.git --enable --yes
+omarchy plugin add https://github.com/Joweb1/omarchy-net-usage.git --enable --yes
 ```
 
 Run the background accounting daemon:
@@ -44,7 +44,7 @@ Run the background accounting daemon:
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/jovibe/omarchy-net-usage.git ~/.config/omarchy/plugins/jovibe.net-usage
+   git clone https://github.com/Joweb1/omarchy-net-usage.git ~/.config/omarchy/plugins/jovibe.net-usage
    ```
 2. Install and enable the background service:
    ```bash

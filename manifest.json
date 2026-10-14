@@ -3,7 +3,7 @@
   "id": "jovibe.net-usage",
   "name": "Network Usage",
   "version": "1.0.0",
-  "author": "jovibe",
+  "author": "Joweb1",
   "description": "Live active session and persistent daily network data usage indicators for the Omarchy status bar",
   "kinds": [
     "bar-widget"
