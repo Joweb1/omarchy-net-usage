@@ -77,6 +77,17 @@ Manual resets (optional):
 
 ---
 
+## Uninstallation
+
+To disable the plugin and remove the background daemon:
+```bash
+omarchy plugin disable jovibe.net-usage
+~/.config/omarchy/plugins/jovibe.net-usage/uninstall.sh
+omarchy plugin remove jovibe.net-usage --yes
+```
+
+---
+
 ## License
 
 MIT License. See [LICENSE](LICENSE) for details.
