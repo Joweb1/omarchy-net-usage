@@ -1,0 +1,395 @@
+#!/usr/bin/env python3
+"""
+omarchy-net-monitor - Lightweight Network Usage Monitor for Omarchy Linux.
+Tracks active network session data and daily data usage with persistence and midnight rollover.
+"""
+
+import sys
+import os
+import json
+import time
+import signal
+import argparse
+from datetime import datetime
+
+# Configure GLib and NetworkManager
+import gi
+gi.require_version('NM', '1.0')
+from gi.repository import GLib, Gio, NM
+
+XDG_RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+RUN_DIR = os.path.join(XDG_RUNTIME_DIR, "omarchy-net")
+STATE_DIR = os.path.expanduser("~/.local/state/omarchy/network-usage")
+PERSIST_FILE = os.path.join(STATE_DIR, "daily.json")
+RUN_SESSION_FILE = os.path.join(RUN_DIR, "session.json")
+RUN_DAILY_FILE = os.path.join(RUN_DIR, "daily.json")
+
+def format_bytes(num_bytes):
+    b = max(0, int(num_bytes))
+    mb = b / (1024 * 1024)
+    if mb < 10.0:
+        return f"{mb:.1f} MB"
+    elif mb < 1000.0:
+        return f"{int(round(mb))} MB"
+    else:
+        gb = b / (1024 * 1024 * 1024)
+        return f"{gb:.2f} GB"
+
+def is_physical_interface(iface):
+    # In Linux, physical network interfaces have a device symlink in sysfs
+    return os.path.islink(f"/sys/class/net/{iface}/device")
+
+def read_proc_net_dev():
+    counters = {}
+    try:
+        with open("/proc/net/dev", "r") as f:
+            lines = f.readlines()
+        for line in lines[2:]:
+            parts = line.split(":")
+            if len(parts) == 2:
+                iface = parts[0].strip()
+                fields = parts[1].split()
+                rx = int(fields[0])
+                tx = int(fields[8])
+                counters[iface] = (rx, tx)
+    except Exception as e:
+        pass
+    return counters
+
+def write_atomic(filepath, content):
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+    tmp_path = filepath + f".tmp.{os.getpid()}"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        f.write(content)
+    os.replace(tmp_path, filepath)
+
+class NetworkMonitor:
+    def __init__(self):
+        self.nm_client = None
+        try:
+            self.nm_client = NM.Client.new(None)
+        except Exception as e:
+            print(f"[omarchy-net-monitor] Warning: Could not initialize NM.Client: {e}", file=sys.stderr)
+
+        self.current_session_key = None
+        self.current_conn_name = None
+        self.current_iface = None
+        self.session_rx = 0
+        self.session_tx = 0
+        self.prev_iface_rx = None
+        self.prev_iface_tx = None
+
+        self.today_date = None
+        self.today_rx = 0
+        self.today_tx = 0
+        self.history = {}
+
+        self.last_persist_time = 0
+        self.dirty = False
+
+        self.load_daily_state()
+
+    def get_local_date_str(self):
+        return datetime.now().astimezone().strftime("%Y-%m-%d")
+
+    def load_daily_state(self):
+        today = self.get_local_date_str()
+        self.today_date = today
+        self.today_rx = 0
+        self.today_tx = 0
+        self.history = {}
+
+        if os.path.isfile(PERSIST_FILE):
+            try:
+                with open(PERSIST_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                saved_date = data.get("date")
+                self.history = data.get("history", {})
+
+                if saved_date == today:
+                    self.today_rx = int(data.get("today_rx", 0))
+                    self.today_tx = int(data.get("today_tx", 0))
+                elif saved_date:
+                    # Archive previous date to history
+                    prev_rx = int(data.get("today_rx", 0))
+                    prev_tx = int(data.get("today_tx", 0))
+                    self.history[saved_date] = {
+                        "rx": prev_rx,
+                        "tx": prev_tx,
+                        "total": prev_rx + prev_tx
+                    }
+                    self.dirty = True
+            except Exception as e:
+                print(f"[omarchy-net-monitor] Error loading daily state: {e}", file=sys.stderr)
+
+        # Prune history older than 14 days
+        if len(self.history) > 14:
+            sorted_dates = sorted(self.history.keys())
+            for old_date in sorted_dates[:-14]:
+                self.history.pop(old_date, None)
+
+    def save_daily_state(self, force=False):
+        now_ts = time.time()
+        if not force and not self.dirty:
+            return
+        if not force and (now_ts - self.last_persist_time < 30):
+            return
+
+        os.makedirs(STATE_DIR, exist_ok=True)
+        data = {
+            "date": self.today_date,
+            "today_rx": self.today_rx,
+            "today_tx": self.today_tx,
+            "today_total": self.today_rx + self.today_tx,
+            "updated_at": datetime.now().astimezone().isoformat(),
+            "history": self.history
+        }
+        try:
+            write_atomic(PERSIST_FILE, json.dumps(data, indent=2) + "\n")
+            self.last_persist_time = now_ts
+            self.dirty = False
+        except Exception as e:
+            print(f"[omarchy-net-monitor] Error saving daily state: {e}", file=sys.stderr)
+
+    def check_midnight_rollover(self):
+        current_date = self.get_local_date_str()
+        if current_date != self.today_date:
+            # Midnight has passed!
+            self.history[self.today_date] = {
+                "rx": self.today_rx,
+                "tx": self.today_tx,
+                "total": self.today_rx + self.today_tx
+            }
+            # Prune history
+            if len(self.history) > 14:
+                sorted_dates = sorted(self.history.keys())
+                for old_date in sorted_dates[:-14]:
+                    self.history.pop(old_date, None)
+
+            self.today_date = current_date
+            self.today_rx = 0
+            self.today_tx = 0
+            self.dirty = True
+            self.save_daily_state(force=True)
+
+    def detect_active_connection(self):
+        """
+        Returns (is_active, conn_name, iface, session_key)
+        """
+        if self.nm_client:
+            try:
+                prim = self.nm_client.get_primary_connection()
+                if prim and prim.get_state() == NM.ActiveConnectionState.ACTIVATED:
+                    devs = prim.get_devices() or []
+                    for dev in devs:
+                        iface = dev.get_iface()
+                        if iface and iface != "lo" and is_physical_interface(iface):
+                            s_key = f"{prim.get_uuid()}:{prim.get_path()}"
+                            return True, prim.get_id() or iface, iface, s_key
+
+                # Fallback: scan active connections for activated physical devices
+                for ac in self.nm_client.get_active_connections() or []:
+                    if ac.get_state() == NM.ActiveConnectionState.ACTIVATED:
+                        if ac.get_connection_type() in ("802-11-wireless", "802-3-ethernet", "gsm", "cdma"):
+                            for dev in ac.get_devices() or []:
+                                iface = dev.get_iface()
+                                if iface and iface != "lo" and is_physical_interface(iface):
+                                    s_key = f"{ac.get_uuid()}:{ac.get_path()}"
+                                    return True, ac.get_id() or iface, iface, s_key
+            except Exception as e:
+                pass
+
+        # Fallback without NetworkManager: check /proc/net/route for default gateway
+        try:
+            with open("/proc/net/route", "r") as f:
+                for line in f.readlines()[1:]:
+                    parts = line.split()
+                    if len(parts) >= 3 and parts[1] == "00000000": # Destination default
+                        iface = parts[0]
+                        if iface != "lo" and is_physical_interface(iface):
+                            return True, iface, iface, f"kernel:{iface}"
+        except Exception:
+            pass
+
+        return False, None, None, None
+
+    def tick(self):
+        self.check_midnight_rollover()
+        net_dev = read_proc_net_dev()
+
+        is_active, conn_name, iface, session_key = self.detect_active_connection()
+
+        if is_active:
+            # Active connection present
+            rx_now, tx_now = net_dev.get(iface, (0, 0))
+
+            if self.current_session_key != session_key:
+                # New session started!
+                self.current_session_key = session_key
+                self.current_conn_name = conn_name
+                self.current_iface = iface
+                self.session_rx = 0
+                self.session_tx = 0
+                self.prev_iface_rx = rx_now
+                self.prev_iface_tx = tx_now
+            else:
+                # Same session continuing - compute delta
+                if self.prev_iface_rx is not None and self.prev_iface_tx is not None:
+                    delta_rx = rx_now - self.prev_iface_rx
+                    delta_tx = tx_now - self.prev_iface_tx
+
+                    # Check for counter reset / wrap (e.g. driver reloaded or device reset)
+                    if delta_rx < 0 or delta_tx < 0:
+                        delta_rx = rx_now if delta_rx < 0 else delta_rx
+                        delta_tx = tx_now if delta_tx < 0 else delta_tx
+
+                    if delta_rx > 0 or delta_tx > 0:
+                        self.session_rx += delta_rx
+                        self.session_tx += delta_tx
+                        self.today_rx += delta_rx
+                        self.today_tx += delta_tx
+                        self.dirty = True
+
+                self.prev_iface_rx = rx_now
+                self.prev_iface_tx = tx_now
+
+            # Output Session Indicator
+            session_total = self.session_rx + self.session_tx
+            session_data = {
+                "text": f"↕ {format_bytes(session_total)}",
+                "tooltip": (
+                    f"Session: {format_bytes(session_total)} (Down: {format_bytes(self.session_rx)}, Up: {format_bytes(self.session_tx)})\n"
+                    f"Connection: {self.current_conn_name} ({self.current_iface})\n"
+                    f"Note: Estimated interface traffic"
+                )
+            }
+            write_atomic(RUN_SESSION_FILE, json.dumps(session_data) + "\n")
+
+        else:
+            # Disconnected
+            if self.current_session_key is not None:
+                # Just transitioned to disconnected
+                self.save_daily_state(force=True)
+
+            self.current_session_key = None
+            self.current_conn_name = None
+            self.current_iface = None
+            self.session_rx = 0
+            self.session_tx = 0
+            self.prev_iface_rx = None
+            self.prev_iface_tx = None
+
+            # When disconnected, empty session file hides indicator
+            write_atomic(RUN_SESSION_FILE, "")
+
+        # Output Daily Indicator (always visible)
+        daily_total = self.today_rx + self.today_tx
+        daily_data = {
+            "text": f"▦ {format_bytes(daily_total)}",
+            "tooltip": (
+                f"Today: {format_bytes(daily_total)} (Down: {format_bytes(self.today_rx)}, Up: {format_bytes(self.today_tx)})\n"
+                f"Daily network traffic estimate (resets at local midnight)\n"
+                f"Date: {self.today_date}"
+            )
+        }
+        write_atomic(RUN_DAILY_FILE, json.dumps(daily_data) + "\n")
+
+        self.save_daily_state()
+        return True
+
+    def on_prepare_for_sleep(self, is_sleeping):
+        if is_sleeping:
+            # Going to sleep: flush state to disk
+            self.save_daily_state(force=True)
+        else:
+            # Woke up: check midnight rollover & reset prev counters
+            self.check_midnight_rollover()
+            self.prev_iface_rx = None
+            self.prev_iface_tx = None
+
+def main():
+    parser = argparse.ArgumentParser(description="Omarchy Network Usage Monitor")
+    parser.add_argument("--status", action="store_true", help="Print current session and daily usage status")
+    parser.add_argument("--oneshot", action="store_true", help="Perform one sample check and write files, then exit")
+    parser.add_argument("--reset-session", action="store_true", help="Reset active session counter to zero")
+    parser.add_argument("--reset-daily", action="store_true", help="Reset today's daily counter to zero")
+    args = parser.parse_args()
+
+    monitor = NetworkMonitor()
+
+    if args.reset_daily:
+        monitor.today_rx = 0
+        monitor.today_tx = 0
+        monitor.dirty = True
+        monitor.save_daily_state(force=True)
+        print("Daily counter reset to 0.")
+        return
+
+    if args.reset_session:
+        monitor.session_rx = 0
+        monitor.session_tx = 0
+        monitor.prev_iface_rx = None
+        monitor.prev_iface_tx = None
+        print("Session counter reset to 0.")
+        return
+
+    if args.status or args.oneshot:
+        monitor.tick()
+        active = monitor.current_session_key is not None
+        status = {
+            "connected": active,
+            "connection": monitor.current_conn_name,
+            "interface": monitor.current_iface,
+            "session_rx": monitor.session_rx,
+            "session_tx": monitor.session_tx,
+            "session_total": monitor.session_rx + monitor.session_tx,
+            "session_formatted": format_bytes(monitor.session_rx + monitor.session_tx),
+            "date": monitor.today_date,
+            "daily_rx": monitor.today_rx,
+            "daily_tx": monitor.today_tx,
+            "daily_total": monitor.today_rx + monitor.today_tx,
+            "daily_formatted": format_bytes(monitor.today_rx + monitor.today_tx),
+        }
+        print(json.dumps(status, indent=2))
+        return
+
+    # Daemon mode
+    loop = GLib.MainLoop()
+
+    def handle_signal(sig, frame):
+        monitor.save_daily_state(force=True)
+        loop.quit()
+
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
+
+    # Listen to system sleep/resume signals
+    try:
+        bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+        def on_sleep_signal(conn, sender, path, iface, sig, params, user_data):
+            is_sleep = params.unpack()[0]
+            monitor.on_prepare_for_sleep(is_sleep)
+
+        bus.signal_subscribe(
+            'org.freedesktop.login1',
+            'org.freedesktop.login1.Manager',
+            'PrepareForSleep',
+            '/org/freedesktop/login1',
+            None,
+            Gio.DBusSignalFlags.NONE,
+            on_sleep_signal,
+            None
+        )
+    except Exception as e:
+        print(f"[omarchy-net-monitor] Warning: Could not subscribe to sleep signals: {e}", file=sys.stderr)
+
+    # Initial tick
+    monitor.tick()
+
+    # Periodic sampling every 2 seconds
+    GLib.timeout_add_seconds(2, monitor.tick)
+
+    loop.run()
+
+if __name__ == "__main__":
+    main()
