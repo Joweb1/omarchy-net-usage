@@ -26,6 +26,28 @@ BarWidget {
   }
 
   readonly property var runtimeDir: Quickshell.env("XDG_RUNTIME_DIR") || ("/run/user/" + Quickshell.env("UID"))
+  readonly property string monitorPath: decodeURIComponent(
+    Qt.resolvedUrl("bin/omarchy-net-monitor").toString().replace(/^file:\/\//, ""))
+
+  // The widget owns the accounting daemon: it starts with the widget and is
+  // stopped by Quickshell when the widget is disabled or the shell exits.
+  Process {
+    id: daemon
+    command: ["python3", root.monitorPath]
+    running: true
+
+    onExited: function(exitCode) {
+      if (exitCode === 0) return
+      restartTimer.restart()
+    }
+  }
+
+  Timer {
+    id: restartTimer
+    interval: 3000
+    repeat: false
+    onTriggered: if (!daemon.running) daemon.running = true
+  }
 
   Process {
     id: sessionProc
@@ -51,8 +73,8 @@ BarWidget {
     repeat: true
     triggeredOnStart: true
     onTriggered: {
-      if (!sessionProc.running) root.bar.runProcess(sessionProc)
-      if (!dailyProc.running) root.bar.runProcess(dailyProc)
+      if (!sessionProc.running) sessionProc.running = true
+      if (!dailyProc.running) dailyProc.running = true
     }
   }
 

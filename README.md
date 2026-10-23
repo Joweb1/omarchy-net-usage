@@ -1,93 +1,65 @@
-# Omarchy Network Usage Indicator (`jovibe.net-usage`)
+# Omarchy Network Usage (`jovibe.net-usage`)
 
-A lightweight, beautiful, resource-efficient status bar widget for [Omarchy](https://omarchy.org/) Linux that displays live active network session data usage and persistent daily data consumption.
+A lightweight status bar widget for [Omarchy](https://omarchy.org/) that shows
+live session data usage and persistent daily data consumption.
 
-![Omarchy Bar](https://raw.githubusercontent.com/Joweb1/omarchy-net-usage/main/preview.png)
+![Omarchy Bar](preview.png)
 
 ## Features
 
-- **Indicator 1: Active Session Usage (`↕`)**
-  - Displays total data consumed during the active network connection session (e.g. `↕ 245 MB`).
-  - Automatically hidden when disconnected.
-  - Automatically starts counting from zero when a new session begins or switches between Wi-Fi, Ethernet, and mobile hotspot.
-  - Tracks upload and download totals separately with detailed hover tooltip.
-- **Indicator 2: Daily Usage (`▦`)**
-  - Displays cumulative daily network traffic (e.g. `▦ 1.42 GB`).
-  - Remains visible even when offline.
-  - Persists across reboots, sleep/resume, and connection cycles.
-  - Automatically rolls over and resets at local midnight (using system timezone).
-  - Handles interface counter resets cleanly without losing recorded data.
-- **Theme & Wallpaper Harmonized**
-  - Defaults to the exact theme foreground color of the active Omarchy theme and wallpaper.
-- **Ultra-Lightweight**
-  - Uses < 0.05% CPU on low-power hardware (such as dual-core Intel Celeron Bay Trail).
-  - Directly samples Linux kernel `/proc/net/dev` and NetworkManager via `libnm`.
-  - Excludes loopback (`lo`) and virtual interfaces (`tun*`, `tailscale*`, `docker*`), avoiding double counting.
-  - Writes live indicators to RAM-backed tmpfs (`$XDG_RUNTIME_DIR`), causing zero flash/disk wear.
+- **Active session usage (`↕`)** — total traffic for the current connection.
+  Hidden while offline, starts from zero on a new connection, and switches
+  cleanly between Wi-Fi, Ethernet, and mobile hotspot.
+- **Daily usage (`▦`)** — cumulative traffic for today, visible even when
+  offline. Persists across reboots and sleep/resume and rolls over at local
+  midnight.
+- **Lightweight** — samples `/proc/net/dev` and NetworkManager directly,
+  ignores loopback/virtual interfaces, and writes live values to
+  `$XDG_RUNTIME_DIR` (tmpfs).
+- **Theme aware** — uses the active Omarchy bar foreground color.
 
----
+## Install
 
-## Installation
-
-### Method 1: Via Omarchy Plugin Manager (Recommended)
-
-```bash
-omarchy plugin add https://github.com/Joweb1/omarchy-net-usage.git --enable --yes
+```sh
+omarchy plugin add https://github.com/Joweb1/omarchy-net-usage.git --enable
 ```
 
-Run the background accounting daemon:
-```bash
-~/.config/omarchy/plugins/jovibe.net-usage/install.sh
+The widget starts and stops its own monitor process. There is no installer
+script, no systemd unit, and no file copied outside the plugin directory.
+
+## Usage
+
+The widget appears in the bar's right section by default. Hover either value
+for download/upload details.
+
+Move it:
+
+```sh
+omarchy bar move jovibe.net-usage --section right
 ```
 
-### Method 2: Manual Installation
+Daily history is kept in `~/.local/state/omarchy/network-usage/`. Live values
+are written to `$XDG_RUNTIME_DIR/omarchy-net/`.
 
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/Joweb1/omarchy-net-usage.git ~/.config/omarchy/plugins/jovibe.net-usage
-   ```
-2. Install and enable the background service:
-   ```bash
-   ~/.config/omarchy/plugins/jovibe.net-usage/install.sh
-   ```
-3. Enable the plugin in your Omarchy status bar:
-   ```bash
-   omarchy plugin enable jovibe.net-usage
-   ```
+## Dependencies
 
----
+- `python3`
+- `python-gobject` (PyGObject) and `libnm` for NetworkManager access
+- `NetworkManager` (a kernel `/proc/net/dev` fallback is used if libnm is
+  unavailable)
 
-## Status and Verification
+## Remove
 
-Inspect live statistics anytime from your terminal:
-```bash
-~/.local/bin/omarchy-net-monitor --status
+```sh
+omarchy plugin remove jovibe.net-usage
 ```
 
-Check the background service:
-```bash
-systemctl --user status omarchy-net-monitor.service
+The monitor stops with the widget. Optionally delete the saved daily history:
+
+```sh
+rm -rf ~/.local/state/omarchy/network-usage
 ```
-
-Manual resets (optional):
-```bash
-~/.local/bin/omarchy-net-monitor --reset-session
-~/.local/bin/omarchy-net-monitor --reset-daily
-```
-
----
-
-## Uninstallation
-
-To disable the plugin and remove the background daemon:
-```bash
-omarchy plugin disable jovibe.net-usage
-~/.config/omarchy/plugins/jovibe.net-usage/uninstall.sh
-omarchy plugin remove jovibe.net-usage --yes
-```
-
----
 
 ## License
 
-MIT License. See [LICENSE](LICENSE) for details.
+MIT. See [LICENSE](LICENSE).

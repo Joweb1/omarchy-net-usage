@@ -2,9 +2,9 @@
   "schemaVersion": 1,
   "id": "jovibe.net-usage",
   "name": "Network Usage",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "Joweb1",
-  "description": "Live active session and persistent daily network data usage indicators for the Omarchy status bar",
+  "description": "Live session and persistent daily network data usage indicators for the Omarchy status bar",
   "kinds": [
     "bar-widget"
   ],
@@ -13,7 +13,9 @@
   },
   "barWidget": {
     "displayName": "Network Usage",
+    "description": "Session and daily data usage, powered by an embedded background monitor",
     "category": "Network",
+    "allowMultiple": false,
     "defaultSection": "right"
   }
 }
