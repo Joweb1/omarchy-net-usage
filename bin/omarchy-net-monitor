@@ -10,6 +10,9 @@ import json
 import time
 import signal
 import argparse
+import fcntl
+import shutil
+import subprocess
 from datetime import datetime
 
 # Configure GLib and NetworkManager
@@ -23,6 +26,17 @@ STATE_DIR = os.path.expanduser("~/.local/state/omarchy/network-usage")
 PERSIST_FILE = os.path.join(STATE_DIR, "daily.json")
 RUN_SESSION_FILE = os.path.join(RUN_DIR, "session.json")
 RUN_DAILY_FILE = os.path.join(RUN_DIR, "daily.json")
+LOCK_FILE = os.path.join(RUN_DIR, "monitor.lock")
+
+# Versions before the widget owned the daemon were installed as a copied script plus a
+# systemd user service. Both write the same state files as this monitor.
+LEGACY_UNIT = "omarchy-net-monitor.service"
+LEGACY_BIN = os.path.expanduser("~/.local/bin/omarchy-net-monitor")
+LEGACY_UNIT_FILE = os.path.expanduser(f"~/.config/systemd/user/{LEGACY_UNIT}")
+LEGACY_WANTS_LINK = os.path.expanduser(f"~/.config/systemd/user/default.target.wants/{LEGACY_UNIT}")
+LEGACY_SIGNATURE = "omarchy-net-monitor - Lightweight Network Usage Monitor"
+HISTORY_BACKUP = PERSIST_FILE + ".pre-migration"
+LOCK_TIMEOUT = float(os.environ.get("OMARCHY_NET_LOCK_TIMEOUT", "15"))
 
 def format_bytes(num_bytes):
     b = max(0, int(num_bytes))
@@ -62,6 +76,155 @@ def write_atomic(filepath, content):
     with open(tmp_path, "w", encoding="utf-8") as f:
         f.write(content)
     os.replace(tmp_path, filepath)
+
+def log(msg):
+    print(f"[omarchy-net-monitor] {msg}", file=sys.stderr, flush=True)
+
+def acquire_single_instance(timeout=LOCK_TIMEOUT):
+    """Hold an exclusive lock for the life of the process, so two monitors can never
+    write the same usage state. Waits briefly, because a restarting widget starts the
+    new monitor while the old one is still exiting. Returns the fd, or None."""
+    os.makedirs(RUN_DIR, exist_ok=True)
+    fd = os.open(LOCK_FILE, os.O_RDWR | os.O_CREAT, 0o600)
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            os.ftruncate(fd, 0)
+            os.write(fd, f"{os.getpid()}\n".encode())
+            return fd
+        except OSError:
+            if time.monotonic() >= deadline:
+                os.close(fd)
+                return None
+            time.sleep(0.2)
+
+def _systemctl(*args, timeout=30):
+    try:
+        return subprocess.run(["systemctl", "--user", *args], capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+def _is_legacy_monitor_file(path):
+    try:
+        with open(path, "rb") as f:
+            return LEGACY_SIGNATURE in f.read(2048).decode("utf-8", "replace")
+    except OSError:
+        return False
+
+def _unit_runs_legacy_monitor():
+    """True only for the unit the old installer wrote, not one the user made their own."""
+    try:
+        with open(LEGACY_UNIT_FILE, "r", encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return False
+    return any(l.strip().startswith("ExecStart=") and "omarchy-net-monitor" in l for l in lines)
+
+def _legacy_pids():
+    """Our own user's processes running the copied script, wherever they were started from."""
+    pids = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit() or int(entry) == os.getpid():
+            continue
+        try:
+            if os.stat(f"/proc/{entry}").st_uid != os.getuid():
+                continue
+            with open(f"/proc/{entry}/cmdline", "rb") as f:
+                argv = f.read().split(b"\0")
+        except OSError:
+            continue
+        if LEGACY_BIN.encode() in argv[:3]:
+            pids.append(int(entry))
+    return pids
+
+def _stop_pids(pids, grace=10.0):
+    """SIGTERM makes the monitor write its counters to disk before it exits."""
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    deadline = time.monotonic() + grace
+    while time.monotonic() < deadline and any(os.path.exists(f"/proc/{p}") for p in pids):
+        time.sleep(0.2)
+    for pid in [p for p in pids if os.path.exists(f"/proc/{p}")]:
+        log(f"legacy monitor {pid} ignored SIGTERM; killing it (up to 30s of counts may be lost)")
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    time.sleep(0.2)
+    return not any(os.path.exists(f"/proc/{p}") for p in pids)
+
+def retire_legacy_install():
+    """Hand over from the old systemd service to the widget-owned monitor.
+
+    Order matters for the history: the old monitor is stopped first, because it flushes its
+    counters on SIGTERM, and only then does this process load daily.json. The history file
+    is shared, so nothing is converted or lost; a copy is kept beside it before anything
+    is touched. Returns False if the old monitor could not be stopped, in which case this
+    process must not start: two writers would overwrite each other.
+    """
+    unit_present = os.path.exists(LEGACY_UNIT_FILE) or os.path.islink(LEGACY_UNIT_FILE)
+    bin_present = os.path.exists(LEGACY_BIN)
+    own_bin = bin_present and _is_legacy_monitor_file(LEGACY_BIN)
+    pids = _legacy_pids() if (own_bin or not bin_present) else []
+    if not (unit_present or own_bin or pids):
+        return True
+
+    log("found the old standalone monitor; retiring it before taking over")
+    if os.path.isfile(PERSIST_FILE) and not os.path.exists(HISTORY_BACKUP):
+        try:
+            shutil.copy2(PERSIST_FILE, HISTORY_BACKUP)
+            log(f"usage history backed up to {HISTORY_BACKUP}")
+        except OSError as e:
+            log(f"could not back up usage history: {e}")
+
+    if unit_present and _unit_runs_legacy_monitor():
+        # `disable --now` stops the service (SIGTERM, waits for exit) and stops it restarting.
+        r = _systemctl("disable", "--now", LEGACY_UNIT)
+        if r is None or r.returncode != 0:
+            _systemctl("stop", LEGACY_UNIT)
+            _systemctl("disable", LEGACY_UNIT)
+        active = _systemctl("is-active", LEGACY_UNIT, timeout=10)
+        if active is None or active.stdout.strip() in ("active", "activating", "reloading"):
+            log("could not stop the legacy systemd service; not starting a second monitor")
+            return False
+        for path in (LEGACY_UNIT_FILE, LEGACY_WANTS_LINK):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        _systemctl("daemon-reload")
+        _systemctl("reset-failed", LEGACY_UNIT, timeout=10)
+        log(f"removed {LEGACY_UNIT}")
+    elif unit_present:
+        log(f"{LEGACY_UNIT_FILE} does not run the old monitor; leaving it alone")
+
+    pids = _legacy_pids() if (own_bin or not bin_present) else []
+    if pids and not _stop_pids(pids):
+        log("could not stop the old monitor process; not starting a second monitor")
+        return False
+
+    if own_bin:
+        try:
+            os.remove(LEGACY_BIN)
+            log(f"removed {LEGACY_BIN}")
+        except OSError as e:
+            log(f"could not remove {LEGACY_BIN}: {e}")
+
+    for root in (os.path.expanduser("~/.config/hypr"), os.path.expanduser("~/.config/autostart")):
+        for dirpath, _, files in os.walk(root):
+            for name in files:
+                path = os.path.join(dirpath, name)
+                try:
+                    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                        if "omarchy-net-monitor" in f.read(200_000):
+                            log(f"{path} still starts the old monitor; remove that line")
+                except OSError:
+                    pass
+    return True
 
 class NetworkMonitor:
     def __init__(self):
@@ -313,7 +476,22 @@ def main():
     parser.add_argument("--oneshot", action="store_true", help="Perform one sample check and write files, then exit")
     parser.add_argument("--reset-session", action="store_true", help="Reset active session counter to zero")
     parser.add_argument("--reset-daily", action="store_true", help="Reset today's daily counter to zero")
+    parser.add_argument("--migrate-legacy", action="store_true", help="Retire the old standalone service/script install, then exit")
     args = parser.parse_args()
+
+    one_shot = args.status or args.oneshot or args.reset_session or args.reset_daily
+
+    if args.migrate_legacy:
+        sys.exit(0 if retire_legacy_install() else 1)
+
+    if not one_shot:
+        # Daemon mode: be the only writer, and retire any old install, before loading state.
+        lock_fd = acquire_single_instance()
+        if lock_fd is None:
+            log("another monitor is already running; exiting")
+            sys.exit(1)
+        if not retire_legacy_install():
+            sys.exit(2)
 
     monitor = NetworkMonitor()
 
